@@ -21,7 +21,7 @@ wnd <- SpatialPointsDataFrame(wnd[2:1], wnd[3:14], proj4string = CRS("+init=epsg
      crop(bounds) %>%
      rasterize(raster(bounds, nrows = 30, ncols = 30)) %>%
      subset(2:13) %>%
-     raster::extract(lake.pt, method = 'bilinear') %>% c %>% rep(113)
+     raster::extract(lake.pt, method = 'bilinear') %>% c %>% rep(113) %>% multiply_by(.794414732) # power law wind profile
 
 pet <- penman(tmn, tmx, wnd , lat = 38.62, CC = cld, z = 100) %>% c
 
