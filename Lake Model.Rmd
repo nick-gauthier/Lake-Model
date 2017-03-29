@@ -1,0 +1,360 @@
+---
+title: "QI Scripts"
+author: "Nick Gauthier"
+date: "March 28, 2015"
+output: html_document
+---
+
+Scripts for downscaling precipitation and calculating risk tradeoffs.
+
+this is the second version, using the pdf for just october- april months
+First import necessary libraries and set the working directory.
+
+```{r}
+library(CDFt)  # for downscaling
+library(raster)  # for manipulating GCM data
+library(magrittr)  # piping functions for code readability
+library(ggplot2) # for figure creation
+library(zoo)
+library(reshape)
+library(gridExtra)
+library(RColorBrewer)
+library(SPEI)
+library(reshape2)
+setwd('~/gdrive/Gygaia Projects/SAA 2015/')
+```
+
+Now import the observed monthly precipitation data from Salihli. Extract just the precipitation series from October 1939 to September 1989 and fill null values.
+
+```{r}
+p.obs.na <- read.csv('Salihli_p.csv')[10:609, 5]  / 10  # raw data in mm*10. subset time series as water years (i.e. first observation is october, last is september)
+
+p.obs<- p.obs.na %>% rev %>% na.locf %>% rev %>% add(na.locf(p.obs.na)) %>% divide_by(2)  # fill NA with avg of adjacent values
+
+tmin.obs <- read.csv('salihli_tmin.csv')[10:465,6] ## so this series is 1966-2005, different than range for p
+tmax.obs <- read.csv('salihli_tmax.csv')[10:465,6]
+```
+
+Now import TraCE-21k GCM data. Extract a time series for the grid cell covering the Salihli weather station. Add the model-output convective and large-scale precipitation variables to get total precipitation. Convert from m/s to mm/month. Subset time series to the calibration period (10 BP - AD 1940) and prediction period (10000 BP - 11 BP).
+
+```{r}
+salihli.pt <- c(28.14, 38.48) %>% matrix(nrow = 1) %>% SpatialPoints  # create a point in Salihli to extract data from GCM
+
+pc <- list.files('GCM Data/PRECC', full.names = T) %>%  # get a list of all GCM output files
+      lapply(brick) %>%                                 # import GCM files as raster bricks
+      lapply(., raster::extract,salihli.pt) %>%         # extract from Salihli's grid cell
+      unlist                                            # combine into a single vector
+
+pl <- list.files('GCM Data/PRECL', full.names = T) %>% 
+      lapply(brick) %>%                                
+      lapply(., raster::extract,salihli.pt) %>%                 
+      unlist                                           
+
+pt <- pc %>% add(pl) %>% multiply_by(60 * 60 * 24 * 30 * 1000)  # add precip components and convert from m/s to mm/month
+
+pt.cal <- pt %>% extract(122278:122877) # 1940 - 1990, water years
+
+pt.pred <- pt %>% extract(62398:122397) 
+
+
+tmin <- list.files('GCM Data/TSMN/', full.names = T) %>%  
+      lapply(brick) %>%                                
+      lapply(., raster::extract,salihli.pt) %>% 
+      unlist %>% subtract(272.15)
+tmax <- list.files('GCM Data/TSMX', full.names = T) %>%  
+      lapply(brick) %>%                                 
+      lapply(., raster::extract,salihli.pt) %>%                  
+      unlist %>% subtract(272.15)    
+
+tmin.cal <- tmin %>% extract(59878:60477)
+tmin.pred <- tmin %>% extract(4:60003) # check these indices, may not exactly line up with p year for year, shouldn't matter for now
+
+tmax.cal <- tmax %>% extract(59878:60477)
+tmax.pred <- tmax %>% extract(4:60003)
+
+wet <- c(F,T,T,T,T,T,T,F,F,F,F,F)
+dry <- c(T,F,F,F,F,F,F,T,T,T,T,T)
+
+  
+# try doing cdf for entire period and compare
+test <- CDFt(p.obs[wet], pt.cal[wet], pt.pred[wet])
+test.annual <- test$DS %>% seq_along %>% divide_by(6) %>% ceiling %>% split(test$DS,.) %>% lapply(mean) %>% unlist
+qplot(x = seq(-5000, -1, 1), y = test.annual, geom = 'point', alpha = I(.5)) + geom_smooth()
+plot(test.annual, wet.annual)
+#more or less the same, but more variance at higher values
+#rmse of 2.4 mm/month ... not bad
+## is this significant, cuz we're still using the same series and its just the extremes that are changeing? I wonder
+
+ calc.cdf.season <- function(pred, cal, obs){
+  ct.wet <- CDFt(obs[wet], cal[wet], pred[wet])$DS
+  ct.dry <- CDFt(obs[dry], cal[dry], pred[dry])$DS
+  
+  yearly.wet <- ct.wet %>% seq_along %>% divide_by(6) %>% ceiling %>% split(ct.wet,.)
+  yearly.dry <- ct.dry %>% seq_along %>% divide_by(6) %>% ceiling %>% split(ct.dry,.)
+  interleaven(yearly.wet, yearly.dry, 1) %>% unlist
+  }
+ 
+#calc.cdf.season <- function(pred, cal, obs){
+  winter <- c(T,T,F,F,F,F,F,F,F,F,F,T)
+  spring <- c(F,F,T,T,T,F,F,F,F,F,F,F)
+  summer <-  c(F,F,F,F,F,T,T,T,F,F,F,F)
+  fall <- c(F,F,F,F,F,F,F,F,T,T,T,F)
+  
+  ct.winter <- CDFt(obs[winter], cal[winter], pred[winter])$DS
+  ct.spring <- CDFt(obs[spring], cal[spring], pred[spring])$DS
+  ct.summer <- CDFt(obs[summer], cal[summer], pred[summer])$DS
+  ct.fall <- CDFt(obs[fall], cal[fall], pred[fall])$DS
+  c(ct.winter, ct.spring, ct.summer, ct.fall)
+}
+
+
+
+
+
+
+
+```
+
+```{r}
+pred.byfifty <- function(pred) {pred %>% seq_along %>% divide_by(600) %>% ceiling %>% split(pred,.)}
+p.byfifty <- pred.byfifty(pt.pred)
+tmin.byfifty <- pred.byfifty(tmin.pred)
+tmax.byfifty <- pred.byfifty(tmax.pred)
+
+
+p.recon <- lapply(p.byfifty, calc.cdf.season, cal = pt.cal, obs = p.obs) %>% unlist 
+p.recon[p.recon < 0] <- 0
+tmin.recon <- lapply(tmin.byfifty, calc.cdf.season, cal = tmin.cal, obs = tmin.obs) %>% unlist
+tmax.recon <- lapply(tmax.byfifty, calc.cdf.season, cal = tmax.cal, obs = tmax.obs) %>% unlist
+
+qplot(x = seq(5000, 1/12,by = -1/6), y = p.recon[dry], geom = 'point') + geom_smooth()
+
+
+
+
+ggplot(annual.recon, aes(x = annual.recon[,1], y = annual.recon[,2])) + 
+  geom_line(alpha = .5) +
+  theme_minimal()
+
+#### calculate PET
+lat_rad <- 38.48 * pi/180
+month <- sapply(1:length(tmin.recon), function(i){i - floor(i/12) * 12})
+m <- sapply(month, function(i){ifelse(i == 0, 12, i)})
+
+d <- data.frame(day = (30 * m) - 15, tmax = tmax.recon, tmin = tmin.recon, lat_rad = lat_rad)
+hargreaves(tmin.recon, tmax.recon, lat = 38.48, na.rm = T)  %>% zoo %>% autoplot(alpha = .5) # , Pre = p.recon
+
+pet.recon <- hargreaves(tmin.recon, tmax.recon, lat = 38.48, na.rm = T)
+pet.recon <- data.frame(yr=index(pet.recon),value=melt(pet.recon)$ET0_har)
+
+
+p.recon.month <- data.frame(date = seq(-5000, -1/6, 1/6), precip = p.recon[dry], month = month.name[4:9])
+
+ggplot(p.recon.month, aes(date, precip)) +  scale_color_brewer(type = 'qual') + geom_smooth(aes(color = month)) + theme_minimal()
+
+
+
+
+p.recon.month <- data.frame(date = seq(-5000, -1/12, 1/12), precip = p.recon, month = c(month.name[9:12], month.name[1:8]))
+
+ggplot(p.recon.month, aes(date, precip)) +  scale_color_brewer(type = 'qual') + geom_smooth(aes(color = month)) + theme_minimal()
+
+
+
+dry.annual <- p.recon[dry] %>% seq_along %>% divide_by(6) %>% ceiling %>% split(p.recon[dry],.) %>% lapply(mean) %>% unlist
+
+
+qplot(x = seq(-5000, -1, 1), y = dry.annual, geom = 'point', alpha = I(.5)) + geom_smooth()
+
+wet.annual <- p.recon[wet] %>% seq_along %>% divide_by(6) %>% ceiling %>% split(p.recon[wet],.) %>% lapply(mean) %>% unlist
+qplot(x = seq(-5000, -1, 1), y = wet.annual, geom = 'point', alpha = I(.5)) + geom_smooth()
+
+
+setwd('~/gdrive/QI Paper/QI R Directory/')
+######## lake water balance
+lake.morph <- read.csv('depthcurve.csv')
+library(mgcv)
+plot(lake.morph)
+vol.to.depth <- gam(depth ~ s(volume), data = lake.morph)
+vol.to.area <- gam(area ~ s(volume), data = lake.morph)
+
+bounds <- extent(570000,610000,4265692,4295000) # make this smaller
+
+beginCluster()
+lake.shapes <- list.files('lake extents', full.names = T) %>% lapply(raster) %>% brick %>% crop(bounds)
+endCluster()
+
+#####pseudocode
+
+bounds <- extent(570000,610000,4265692,4295000) # make this smaller
+catchment <- raster('marmara_watershed.tif') %>% crop(bounds) %>% projectRaster(lake.shapes[[1]], method = 'ngb') 
+catchment.area <-  catchment %>% is.na %>% not %>% cellStats(sum) * 900 
+#catch.1km <- raster('marmara_watershed_1km.tif') %>% crop(bounds)
+Con=function(condition, trueValue, falseValue){
+  return(condition * trueValue + (!condition)*falseValue)
+}
+
+
+# Initialize soil moisture "bucket"
+start.vol <- 40000000 
+height <- predict.gam(vol.to.depth, data.frame(volume = start.vol)) %>% add(72) %>% round(1)
+
+bucket <- 0 # bucket at month 0
+full.bucket <- 50
+volume <- start.vol
+# Step through all the months, apportioning rainfall 
+# into runoff and infiltration, then updating the bucket
+# to calculate AET/PET in each month
+
+vols.out <- c(1:length(tmin.recon))
+for (i in 1:length(vols.out)){
+    lake.area <- predict.gam(vol.to.area, data.frame(volume = volume))
+    catchment.area.nolake <- catchment.area - lake.area
+    
+    atmos.exchange <- p.recon[i] - pet.recon[i,2] * 1.1 # multiple by open water coefficient kw
+    
+    # Calculate actual evapotranspiration (AET)
+    beta <- bucket / full.bucket     # soil moisture "stress"
+    aet <- beta * pet.recon[i,2]          # Actual ET
+    
+    # Calculate infiltration fraction of precip
+    #  (75% if bucket is empty, 25% when bucket is full)
+    infilt <- 0.75 - 0.5 * beta
+    
+    # Runoff is what's left after infiltration into bucket
+    runoff <- p.recon[i] * (1-infilt)  
+    
+    # Update the soil moisture bucket
+    bucket <- bucket + p.recon[i] - aet  
+    bucket <- Con(bucket < 0, 0, bucket)
+    
+    # If bucket overflows, add excess to runoff
+    runoff <- Con(bucket > full.bucket, runoff + bucket - full.bucket, runoff)
+    bucket <- Con(bucket > full.bucket, full.bucket, bucket)
+    
+    volume <- volume + runoff / 1000 * catchment.area.nolake + atmos.exchange / 1000 * lake.area
+  
+    if(volume < 0){volume <- 0}
+    #if(volume > 113105600){volume <- 113105600}
+    vols.out[i] <- volume
+}
+
+area.out = predict.gam(vol.to.area, data.frame(volume = vols.out))
+depth.out = predict.gam(vol.to.depth, data.frame(volume = vols.out))
+
+centuries <- rep(seq(-5,-.1,.1), each = 1200) %>% as.factor
+qplot(x = centuries, y = area.out, geom = 'boxplot') + theme_minimal()
+
+
+
+qplot(x = seq(-5000,-1/12,1/12), y = depth.out, alpha = I(.5), geom = 'line') + theme_minimal() + stat_smooth(method = 'gam', formula = y ~ s(x, bs = "cs", k = 500), color ='black',lwd = 1.5, alpha = .8) + labs(title = 'Simulated Lake Levels', x = 'Years BP', y = 'Depth (m)')
+ggsave('depthrecon.pdf')
+
+#######
+
+###### cdft method figures
+ct <- CDFt(obs, cal, pred) %>% extract(2:5) %>% data.frame(., Percentile = 1:100) %>% melt(id.vars = "Percentile")
+qplot(x = Percentile, y=value, group=variable,color = variable, lwd = I(2), alpha = I(1), data = ct, geom='line') + science_theme + scale_color_brewer(name = '', labels = c('Observed climate', 'GCM climate, modern', 'GCM climate, past', 'Reconstructed climate'), palette = 'RdBu') + labs(x='\nPrecipitation percentile', y= 'Cumulative probability\n', title = 'Cumulative density function transform\n')
+ggsave('cdf.pdf')
+######
+
+
+
+
+
+####### calibration on modern data
+
+lake.cal <- read.csv('~/Desktop/salihli_calibration.csv')
+lake.cal$pet <- hargreaves(lake.cal$tmin, lake.cal$tmax, lat = 38.48, na.rm = T) %>% melt %>% use_series(ET0_har)
+
+# Initialize soil moisture "bucket"
+start.vol <- 107977785   
+height <- predict.gam(vol.to.depth, data.frame(volume = start.vol)) %>% add(72) %>% round(1)
+
+bucket <- 0 # bucket at month 0
+full.bucket <- 50
+volume <- start.vol
+# Step through all the months, apportioning rainfall 
+# into runoff and infiltration, then updating the bucket
+# to calculate AET/PET in each month
+
+vols.out <- c(1:384)
+for (i in 1:384){
+    lake.area <- predict.gam(vol.to.area, data.frame(volume = volume))
+    catchment.area.nolake <- catchment.area - lake.area
+    
+    atmos.exchange <- lake.cal[i,1] - lake.cal[i,4] * 1.1 # multiple by open water coefficient kw
+    
+    # Calculate actual evapotranspiration (AET)
+    beta <- bucket / full.bucket     # soil moisture "stress"
+    aet <- beta * lake.cal[i,4]          # Actual ET
+    
+    # Calculate infiltration fraction of precip
+    #  (75% if bucket is empty, 25% when bucket is full)
+    infilt <- 0.75 - 0.5 * beta
+    
+    # Runoff is what's left after infiltration into bucket
+    runoff <- lake.cal[i,1] * (1-infilt)  
+    
+    # Update the soil moisture bucket
+    bucket <- bucket + lake.cal[i,1] * infilt  - aet  
+    bucket <- Con(bucket < 0, 0, bucket)
+    
+    # If bucket overflows, add excess to runoff
+    runoff <- Con(bucket > full.bucket, runoff + bucket - full.bucket, runoff)
+    bucket <- Con(bucket > full.bucket, full.bucket, bucket)
+    
+    volume <- volume + runoff / 1000 * catchment.area.nolake + atmos.exchange / 1000 * lake.area
+  
+    if(volume < 0){volume <- 0}
+    if(volume > 113105600){volume <- 113105600}
+    vols.out[i] <- volume
+}
+
+qplot(x = 1:384, y = vols.out/ 1000000, geom = 'line') + theme_minimal()
+
+
+```
+
+
+```{r}
+science_theme = theme_minimal(base_family = "Helvetica") + 
+  theme(text = element_text(size=24), panel.grid.major = element_line(size = 0.5, color = "black"), panel.grid.minor = element_line(size=.2, color='darkgrey'))#, 
+   # axis.line = element_line(size = 0.7, color = "black"))
+
+
+```
+
+
+```{r}
+
+underfour.cen <- depth.out %>% seq_along %>% divide_by(1200) %>% ceiling %>% split(depth.out,.)
+underfour.risk <- lapply(underfour.cen, function(x) sum(x<4) / 1200) %>% unlist
+risk <- data.frame(date = seq(-5000,-100,100), drought = underfour.risk)
+
+ggplot(data=risk, aes(date)) +
+  geom_bar(aes(y = drought, fill = drought, color = drought), stat='identity') + labs(x = '\nYears BP', y = 'Monthly Risk of Desication', title="Risks of droughts by century") + science_theme
+
+ggsave('risk.pdf')
+
+
+c("#800026", "#BD0026", "#E31A1C", "#FC4E2A", "#FD8D3C", "#FEB24C", "#FED976", "#FFEDA0", "#FFFFCC", "#FFFFCC", "#EDF8B1", "#C7E9B4", "#7FCDBB", "#41B6C4", "#1D91C0", "#225EA8","#253494", "#081D58")
+       
+       y=flood.risk, geom='bar', stat='identity', color = flood.risk, fill = flood.risk) + 
+geom_bar(aes(-1*wheat.failure), stat='identity') 
+
+
+c(brewer.pal(9,'YlGnBu'), brewer.pal(9,'YlOrRd'))
+
+
+scale_color_gradientn(name = "Risk", colours=brewer.pal(9,'YlGnBu')) +
++ scale_color_gradientn(name = "Risk", colours=brewer.pal(9,'YlOrRd')) 
+
+
+
++ labs(x = 'Years BP', y = 'Risk of flooding', title="Risk of flooding by century") + scale_x_continuous(breaks = seq(-10000,0,1000))
+
+```
+
+
+

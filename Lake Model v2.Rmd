@@ -1,0 +1,355 @@
+---
+title: "Lake Marmara Water Level Simulation"
+author: "Nick Gauthier"
+date: "March 28, 2015"
+output: 
+  html_document: 
+    highlight: tango
+    theme: cosmo
+---
+
+This script downscales TraCE-21k precipitation and temperature data for the last 5ka, and uses these estimates to force a conceptual rainfall-runoff model with lake routing.  
+  
+## Setup environment
+First import necessary libraries.
+
+```{r message = F}
+#library(CDFt)  # downscaling
+library(magrittr)  # piping functions for code readability
+library(raster)  # manipulating GCM data
+library(ggplot2) # figure creation
+library(zoo) # time series functions
+library(reshape2)
+library(mgcv) # fit nonlinear volume-depth-area functions
+library(SPEI)
+library(parallel)
+```
+  
+  
+  
+## Data import and preprocessing  
+### Observed weather data  
+First import the observed monthly precipitation and temperature data for the Salihli weather station. These data were acquired by Roosevelt from the Turkish government through a FOI request.   
+
+#### Observed precipitation
+Starting with precipitation, we extract the monthly rainfall accumulation series (column 5) between October 1939 and September 1989 (rows 10 to 609). We use water years (Oct. - Sept.) instead of calendar years. These data are recorded as tenths of millimeters, so must be converted to millimeters.
+
+```{r}
+cru <- data.frame(date = seq(1901,2014-1/12,1/12), 
+                  pre = (brick('~/gdrive/climate data/cru/CRU TS 3.22/cru_ts3.22.1901.2013.pre.dat.nc') %>% 
+                           raster::extract(salihli.pt, method = 'bilinear'))[1,],
+                  pet = (brick('~/gdrive/climate data/cru/CRU TS 3.22/cru_ts3.22.1901.2013.pet.dat.nc') %>% 
+                           raster::extract(salihli.pt, method = 'bilinear'))[1,] * 30,
+                  seasons = c(rep('Winter',3), rep('Summer', 6), rep('Winter', 3))) 
+```
+
+
+```{r echo = F}
+ggplot(cru, aes(date, pre, color = seasons)) + 
+  geom_point(size = 2, position = 'jitter', alpha = .7) +
+  geom_smooth(aes(fill = seasons), size = 1) + 
+  labs(title = 'Observed Precipitation', x = 'Year', y = 'Monthly precipitaiton (mm)') + 
+  theme_bw()
+
+ggplot(cru, aes(date, pet, color = seasons)) + 
+  geom_point(size = 2, position = 'jitter', alpha = .7) +
+  geom_smooth(aes(fill = seasons), size = 1) + 
+  labs(title = 'Observed Potential Evapotranspiration', x = 'Year', y = 'Monthly potential evapotranspiration (mm)') + 
+  theme_bw()
+```
+
+#### Observed temperature and reference evapotranspiration calculation
+We calculate potential evapotranspiration from observed monthly mean maximum and minimum daily temperature data. Unlike the precipitation data above, the temperature series from Salihli were acquired from the [FAOClim-Net](http://geonetwork3.fao.org/climpag/agroclimdb_en.php) database. As a result, we only have temperature data going back to 1966. In order to get a 39-year series to approximate the length of the precipitation series, we extract data from October 1966 to September 2004.  
+
+>  Question for me . . . is it more important to have a series from the correct time period or of the correct length? Should we try harder to get min/max temp data for the same time period as precipitation?
+
+```{r}
+tmin.obs <- read.csv('salihli_tmin.csv')[1:408, 6]
+tmax.obs <- read.csv('salihli_tmax.csv')[1:408, 6]
+```
+
+We have no direct measurements of evapotranspiration from Salihli. We therefore use the minimum and maximum temperature series to calculate reference evapotranspiration using the Hargreaves equation, as implemented in the [hargreaves()](http://www.inside-r.org/node/133769) function in the ['SPEI' R package](http://cran.r-project.org/web/packages/SPEI/index.html). This formula uses minimum and maximum temperature, together with an estimate of mean external radiation estimated from the latitude and month, to calculate the monthly ET0 of a grass crop.
+
+To feed temperature data into the hargreaves() function that does not start in January, we have to create a time series object first.
+
+```{r}
+
+```
+
+```{r echo = F}
+et0.dat <- data.frame(date = seq(1966, 2005-1/12, 1/12), et0 = et0.obs, Season = seasons)
+
+ggplot(et0.dat, aes(date, et0, color = Season)) + 
+  geom_point(size = 2, position = 'jitter', alpha = .7) +
+  geom_smooth(aes(fill = Season), size = 1) + 
+  scale_color_manual(values = c('#fdae61', '#abdda4','#d7191c', '#2b83ba')) +
+  scale_fill_manual(values = c('#fdae61', '#abdda4','#d7191c', '#2b83ba')) +
+  labs(title = 'Observed reference evapotranspiration at Salihli', x = 'Water year', y = 'Evapotranspiration (mm)') +
+  theme_bw()
+
+```
+  
+  
+  
+  
+### Climate model data
+Now we import TraCE-21k postprocessed monthly averaged atmosphere data, downloaded previously from [Earth System Grid](https://www.earthsystemgrid.org/dataset/ucar.cgd.ccsm3.trace.html). These data are subdivided by time period into several netcdf files, so the scripts below requires the outputs for each variable to be stored in their own subdirectory.  
+  
+Define a function to import all the netcdf files in a given directory, combine them into a single raster brick, and extract the GCM data by bilinearly interpolating it at the location of the Salihli weather station.
+
+```{r}
+salihli.pt <- c(28.00, 38.62) %>% matrix(nrow = 1) %>% SpatialPoints # create a point at Salihli weather station
+
+trace.import <- function(var){
+  list.files(var, full.names = T) %>%        # get a list of all GCM outputs for the given variable
+  lapply(brick) %>%                          # import GCM files as raster bricks
+  lapply(., raster::extract, salihli.pt, method = 'bilinear') %>%  # extract over salihli, bilinearly interpolated from neighboring GCM cells
+  unlist                                     # combine into a single series
+}
+```
+  
+  
+#### Precipitation  
+Import TraCE-21k outputs for large scale precipitation (PRECL in CCSM3) and convective precipitation (PRECC). Add them together to get total precipitaiton (PRECT). Convert from m/s to mm/month. Subset time series to the calibration period (10 BP - AD 1940) and prediction period (5000 BP - 11 BP).
+
+```{r}
+pc <- trace.import('PRECC') # import convective precip
+pl <- trace.import('PRECL') # import large scale precip                                       
+
+pt <- pc %>% add(pl) %>% multiply_by(60 * 60 * 24 * 30 * 1000)  # calc total prec and convert to mm/mo
+
+pt.cal <- pt %>% magrittr::extract(59878:60477) # subset to 1940 - 1990 AD in water years
+pt.pred <- pt %>% magrittr::extract(10:60477) # subset to 5000 BP - AD 1990 in water years 
+```
+  
+  
+#### Temperature and reference evapotranspiration
+Import TraCE-21k outputs for monthly mean minimum and maximum surface temperatures, in kelvin. Convert to celsisus.
+
+```{r}
+# import temps and convert to celsius
+tmin <- trace.import('TSMN') %>% subtract(273.15)
+tmax <- trace.import('TSMX') %>% subtract(273.15)
+```
+ 
+
+ Calculate reference evapotranspiration from the TraCE-21k temperature data using the Hargreaves method and subset to calibration and prediction periods as above. Because these data start in January (haven't been shifted to water years yet), we don't have to convert to a ts object first.
+ 
+```{r}
+et0 <- hargreaves(tmin, tmax, lat = 38.48, na.rm = T) %>% c
+
+et0.cal <- et0 %>% extract(59878:60477) # subset to calibration period (1940-1990 AD in water years)
+et0.pred <- et0 %>% extract(10:60009) # subset to prediction period (5000 - 11 BP in water years)
+```
+  
+  
+  
+  
+## Downscaling with CDF-t  
+We downscale and bias-correct the TraCE-21k output data using the cumulative distribution function transform method of Michelangeli *et al.* as implemented in the [CDFt() function](http://www.inside-r.org/packages/cran/CDFt/docs/CDFt) in the ['CDFt' R package](http://cran.r-project.org/web/packages/CDFt/index.html)  
+
+>  [Michelangeli, P‐A., M. Vrac, and H. Loukos. "Probabilistic downscaling approaches: Application to wind cumulative distribution functions." Geophysical Research Letters 36, no. 11 (2009).](http://dx.doi.org/10.1029/2009GL038401)  
+  
+  Because we only have a few decades of observed data to calibrate our statistical model, and several millennia to downscale, we need to first break up prediction period into 50 year chunks. Applying the CDF transform to each chunk in succession, rather than the entire model time series, ensures that the calibration and prediction periods have similar amounts of variability.  
+  First define a function to break up the TraCE-21k data into 50-yr chunks. The 600 in the divide_by() function represents the number of months in a 50 year period. Change this number accordingly to change the chunk size.
+```{r}  
+  by50 <- function(pred){pred %>% seq_along %>% divide_by(600) %>% ceiling %>% split(pred,.)}
+```
+  
+  Apply this function to the 5000 years of TraCE-21k output. The result is an ordered list of 100 50-yr series for each variable.
+  
+```{r}
+p.50 <- by50(pt.pred)
+et0.50 <- by50(et0.pred)
+```
+  Next we write a function that will take the observed weather data and a 50yr chunk of TraCE-21k outputs and calculate the CDF transform for each season. Then we apply this function to each of the 100 50-yr chunks in succession.
+```{r}
+winter <- c(F,F,T,T,T,F,F,F,F,F,F,F)
+spring <- c(F,F,F,F,F,T,T,T,F,F,F,F)
+summer <-  c(F,F,F,F,F,F,F,F,T,T,T,F)
+fall <- c(T,T,F,F,F,F,F,F,F,F,F,T)
+
+calc.cdf.season <- function(pred, cal, obs){
+  #ct.winter <- CDFt(obs[winter], cal[winter], pred[winter])$DS
+  #ct.spring <- CDFt(obs[spring], cal[spring], pred[spring])$DS
+  #ct.summer <- CDFt(obs[summer], cal[summer], pred[summer])$DS
+  #ct.fall <- CDFt(obs[fall], cal[fall], pred[fall])$DS
+  
+  recon.out <- 0
+  for(i in seq(1, 150, 3)){
+    win <- ct.winter[i:(i+2)]
+    spr <- ct.spring[i:(i+2)]
+    sum <- ct.summer[i:(i+2)]
+    fal <- ct.fall[i:(i+2)]
+    recon.out <- c(recon.out, fal[1:2],win,spr,sum,fal[3])
+  }
+  return(recon.out[2:601])
+}
+
+p.recon <- lapply(p.50, calc.cdf.season, cal = pt.cal, obs = p.obs) %>% unlist
+p.recon[p.recon < 0] <- 0 # sometimes the reconstruction drops below 0, fix these cases
+# will have to change this replace with 0 thing to instead fit the CDFs only to days with rain
+et0.recon <- lapply(et0.50, calc.cdf.season, cal = et0.cal, obs = et0.obs) %>% unlist
+
+```
+
+> Question for me . . . Assess whether adding in the 'dev' argument for CDFt() does anything helpful
+
+```{r echo = F}
+
+recons <- data.frame(date = seq(-5000, -1/12, 1/12), p = p.recon, et0 = et0.recon, Season = seasons)
+
+ggplot(recons, aes(date, p - et0, color = Season)) + 
+  geom_point(size = 2, position = 'jitter', alpha = .7) +
+  geom_smooth(aes(fill = Season), size = 1) + 
+  scale_color_manual(values = c('#fdae61', '#abdda4','#d7191c', '#2b83ba')) +
+  scale_fill_manual(values = c('#fdae61', '#abdda4','#d7191c', '#2b83ba')) +
+  labs(title = 'Observed reference evapotranspiration at Salihli', x = 'Water year', y = 'Evapotranspiration (mm)') +
+  theme_bw()
+```
+
+
+## Hydrological Modeling
+A conceptual rainfall-runoff model with lake routing.  
+  
+### Lake morphometry  
+  We first need to define a function that can calculate the depth and/or surface area of Lake Marmara given a certain volume of water. We ran a flood-fill algorithm in GRASS GIS on a hybrid DEM/bathymetric model to calculate the volume and surface area of water given different depths, and exported these data as 'depthcurve.csv'. We import this file, and use the 'mgcv' package to fit curves using generalized additive models with default smoothing parameters. 
+```{r}
+lake.morph <- read.csv('depthcurve_dam.csv') # data output from flood-fill algorithm in GRASS
+lake.morph$depth <- seq(72,81.2,.05)
+vol.to.depth <- gam(depth ~ s(volume, k = 45), data = lake.morph) # function for converting volume to depth
+vol.to.area <- gam(area ~ s(volume, k = 45), data = lake.morph) # function for converting volume to area
+```
+These are the resulting functions:  
+
+```{r echo = F}
+plot(vol.to.depth, xlab = 'Lake water volume (cubic meters)', main = 'Lake Marmara Volume-Depth relationship')
+plot(vol.to.area, xlab = 'Lake water volume (cubic meters)', main = 'Lake Marmara Volume-Area relationship')
+```
+  
+  
+### Rainfall-runoff and water balance simulation  
+  
+#### Simulation parameters  
+Define some initial parameters and variables:  
+'basin.area' is the total surface area of Lake Marmara's watershed, in sq. m. This area, minus the area of the lake itself, will be combined with the precipitation/evapotranspiration estimates to calculate the volume of water moving into the lake each month.
+
+
+```{r}
+basin.area <- 247725900  # surface area of Lake Marmara watershed in sq. m, w/o dam, if there is a dam its 247725900 ##326796300  #1780000000 from wiki,
+```
+
+We need to define the maximum amount of water that the soil column can hold. In the TAMS report, the usable water quantity for Manisa and Adana soil series (the gravelly and silty loams, respectively, that predominate in the lake watershed) is about 150mm, but ranges from 130 to 170.
+```{r}
+field.capacity <- 150
+```
+
+We also need to quantify the groundwater flow in and out of the basin. We represent this with the parameters X5, where values below 1 represent net groundwater outflow and values above 1 represent net groundwater inflow. We have no way of measuring this value reliably in the field, so we need to calibrate this using observed water level variations at Lake Marmara
+lake model
+```{r}
+  q.in <- rnorm(408, q.in.avg, q.in.sd) * 60 * 60 * 24 * 30
+  q.out <- rnorm(408, q.out.avg, q.out.sd) * 60 * 60 * 24 * 30
+gr2m <- function(P, E, X1, X2){
+  sim.length <- length(P)
+  
+  R <- 0  # initialize soil reservoir level 
+  S <- 0 # initialize soil water content
+  
+  volume <- 100000000
+  vols.out <- c(1:sim.length)
+
+  for (i in 1:sim.length){
+      lake.area <- predict.gam(vol.to.area, data.frame(volume = volume))
+      basin.area.nolake <- basin.area - lake.area
+      
+      atmos.exchange <- P[i] - E[i] # multiply by open water coefficient kw
+    
+      ###### we doing the new model now
+      phi <- tanh(P[i] / X1)
+      psi <- tanh(E[i] / X1)
+      
+      S1 <- (S + X1 * phi) / (1 + phi * (S / X1))
+      P1 <- P[i] + S - S1
+      S2 <- (S1 * (1 - psi)) / (1 + psi * (1 - (S1 / X1)))
+      S <- S2 / (1 + (S2 / X1)^3)^(1/3)
+      P2 <- S2 - S
+      P3 <- P1 + P2
+      R1 <- R + P3
+      R2 <- X2 * R1
+      Q <- R2^2 / (R2 + 60 )
+      R <- R2 - Q
+      
+      volume <- volume + Q *.001 * basin.area.nolake + atmos.exchange * .001 * lake.area + q.in[i]
+      if(lake.area > 3500000){ volume <- volume - q.out[i]}
+      
+      if(volume < 0){volume <- 0}
+      if(volume > 290000000){volume <- 290000000}
+      vols.out[i] <- volume
+        }
+  return(vols.out)
+}
+
+vols.out <- gr2m(p.recon,et0.recon,150,1.2)
+
+mc.test <- mcmapply(gr2m, X1 = rnorm(400, 150, 25), X2 = runif(400, 0, 2), MoreArgs = list(P = p.recon, E = et0.recon), mc.cores = 8)
+
+mc.test.sums <- data.frame(YEAR = seq(-5000,-1/12,1/12), MEAN = apply(mc.test, 1, mean), SD = apply(mc.test, 1, sd), MAX = apply(mc.test, 1, max), MIN = apply(mc.test, 1, min))
+
+
+```
+
+
+
+centuries <- rep(seq(-5,-.1,.1), each = 1200) %>% as.factor
+qplot(x = centuries, y = depth.out, geom = 'boxplot') + theme_minimal()
+
+
+
+qplot(x = seq(-5000,-1/12,1/12), y = depth.out, alpha = I(.5), geom = 'line') + theme_minimal() + stat_smooth(method = 'gam', formula = y ~ s(x, k = 15), color ='black',lwd = 1.5, alpha = .8) + labs(title = 'Simulated Lake Levels', x = 'Years BP', y = 'Depth (m)')
+
+###
+
+annual <- vols.out %>% seq_along %>% divide_by(12) %>% ceiling %>% split(vols.out,.) %>% lapply(mean) %>% unlist
+
+qplot(x = seq(-5000,-1,1), y = annual, alpha = I(.5), geom = 'line') + theme_minimal() + stat_smooth(method = 'gam', formula = y ~ s(x, k = 25), color ='black',lwd = 1.5, alpha = .8) + labs(title = 'Simulated Lake Levels', x = 'Years BP', y = 'Depth (m)')
+
+vols.out <- wlf.recon$volume
+cen.avg <- data.frame(year = seq(-10200, 100, 100),
+  mean = vols.out %>% seq_along %>% divide_by(1200) %>% ceiling %>% split(vols.out,.) %>% lapply(mean) %>% unlist,
+  min = vols.out %>% seq_along %>% divide_by(1200) %>% ceiling %>% split(vols.out,.) %>% lapply(min) %>% unlist,
+  max = vols.out %>% seq_along %>% divide_by(1200) %>% ceiling %>% split(vols.out,.) %>% lapply(max) %>% unlist,
+  sd = vols.out %>% seq_along %>% divide_by(1200) %>% ceiling %>% split(vols.out,.) %>% lapply(sd) %>% unlist 
+)
+
+
+ggplot(data = cen.avg, aes(x = year)) + geom_ribbon(aes(ymin=min, ymax = max), alpha =.5, fill = 'lightblue') + geom_ribbon(aes(ymin=mean - sd*2, ymax = mean + sd*2), alpha = .6, fill='lightblue') + geom_ribbon(aes(ymin = mean - sd, ymax = mean + sd), alpha = .5, fill='blue') + geom_smooth(aes(y=mean), color = 'black') + theme_minimal() +
+scale_x_continuous(breaks = seq(-10000,0, 1000))
+
+ggplot(data = mc.test.sums, aes(x = YEAR)) + geom_ribbon(aes(ymin=MIN, ymax = MAX), alpha = .5, fill='lightblue') + geom_ribbon(aes(ymin = MEAN - SD, ymax = MEAN + SD), alpha = .5, fill='blue') + theme_minimal()
+
+cen.avg <- data.frame(year = seq(-5000, -50, 50),
+  mean = area.out %>% seq_along %>% divide_by(600) %>% ceiling %>% split(area.out,.) %>% lapply(mean) %>% unlist,
+  min = area.out %>% seq_along %>% divide_by(600) %>% ceiling %>% split(area.out,.) %>% lapply(min) %>% unlist,
+  max = area.out %>% seq_along %>% divide_by(600) %>% ceiling %>% split(area.out,.) %>% lapply(max) %>% unlist,
+  sd = area.out %>% seq_along %>% divide_by(600) %>% ceiling %>% split(area.out,.) %>% lapply(sd) %>% unlist 
+)
+
+cen.avg <- data.frame(year = seq(-5000, -50, 50),
+  mean = depth.out %>% seq_along %>% divide_by(600) %>% ceiling %>% split(depth.out,.) %>% lapply(mean) %>% unlist,
+  min = depth.out %>% seq_along %>% divide_by(600) %>% ceiling %>% split(depth.out,.) %>% lapply(min) %>% unlist,
+  max = depth.out %>% seq_along %>% divide_by(600) %>% ceiling %>% split(depth.out,.) %>% lapply(max) %>% unlist,
+  sd = depth.out %>% seq_along %>% divide_by(600) %>% ceiling %>% split(depth.out,.) %>% lapply(sd) %>% unlist 
+)
+
+
+depth.out
+write.csv(depth.out, file='depth_recon.csv')
+#ggsave('depthrecon.pdf')
+```
+#######
+
+###### cdft method figures
+ct <- CDFt(obs, cal, pred) %>% extract(2:5) %>% data.frame(., Percentile = 1:100) %>% melt(id.vars = "Percentile")
+qplot(x = Percentile, y=value, group=variable,color = variable, lwd = I(2), alpha = I(1), data = ct, geom='line') + science_theme + scale_color_brewer(name = '', labels = c('Observed climate', 'GCM climate, modern', 'GCM climate, past', 'Reconstructed climate'), palette = 'RdBu') + labs(x='\nPrecipitation percentile', y= 'Cumulative probability\n', title = 'Cumulative distribution function transform\n')
+ggsave('cdf.pdf')
+######

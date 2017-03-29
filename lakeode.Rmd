@@ -1,0 +1,105 @@
+---
+title: "Shallow Lake Socioecology"
+author: "Nicolas Gauthier"
+date: "October 22, 2016"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+##Setup
+
+```{r}
+library(deSolve)
+```
+
+##Lake Model
+
+Differential equation for shallow lake model
+Import phaseR
+```{r}
+library(phaseR)
+```
+
+write model in deSolve format
+```{r}
+lakeMod <- function(t, y, parameters){
+     with(as.list(c(y, parameters)), {
+      dV  <- (ha^p)/(A^p + ha^p)              # Monod equation for vegetation
+      dA <- r * A * (N/(N+hn)) * (hv/(hv+V)) - c * A^2   # cells, e.g. algae
+      list(c(dV,dA))
+    })
+     
+} 
+
+parameters <- c(
+    r = 1.0,             #intrinsic growth of algae
+    c = 1.0,            # competition coefficient
+    p = 1.0,           # shallowness constant
+    N = 2.0,           # nutrients
+    ha  = 0.5,           # half saturation constant of algae
+    hn  = 0.5,           # half saturation constant of nutrients
+    hv = 0.5             # half saturation constant of vegetation
+)
+t <- seq(0,40,.5)
+y  <- c(V=10, A=10) # cells / L; Substrate umol / L
+```
+
+
+Run the simulation
+```{r}
+out <- lsoda(y, t, lakeMod, parameters)
+```
+
+```{r}
+library(ggplot2)
+out.df = as.data.frame(out) # required by ggplot: data object must be a data frame
+    library(reshape2)
+    out.m = melt(out.df, id.vars='time') # this makes plotting easier by puting all variables in a single column
+    
+    p <- ggplot(out.m, aes(time, value, color = variable)) + geom_point()
+    print(p)
+
+ p2 <- ggplot(data = out.df[1:81,], aes(x = V, A, color = time)) + geom_point()
+    print(p2)
+```
+
+
+Phase plot
+```{r}
+lakeMod <- function(t, y, parameters){
+         
+r = 0.3            #intrinsic growth of algae
+    c = 0.3         # competition coefficient
+    p = .7           # shallowness constant
+    N = .1           # nutrients
+    ha  = 1           # half saturation constant of algae
+    hn  = 1           # half saturation constant of nutrients
+    hv = 1             # half saturation constant of vegetation
+      dy <- r * y * (N/(N+hn)) * (hv/(hv+((ha^p)/(y^p + ha^p)))) - c * y^2   # cells, e.g. algae
+      list(dy)
+} 
+
+parameters <- c(
+    r = .5,             #intrinsic growth of algae
+    c = .5,            # competition coefficient
+    p = 1.0,           # shallowness constant
+    N = 2.0,           # nutrients
+    ha  = 0.5,           # half saturation constant of algae
+    hn  = 0.5,           # half saturation constant of nutrients
+    hv = 0.5             # half saturation constant of vegetation
+)
+t <- seq(0,40,.5)
+y  <- c(V=10, A=10) # cells / L; Substrate umol / L
+phasePortrait(lakeMod, y.lim= c(0,2))
+lake.flow <- flowField(lakeMod, x.lim = c(0,5), y.lim = c(0,10), system = 'one.dim', add = F)
+lake.null <- nullclines(lakeMod, x.lim = c(0,5), y.lim = c(0,10), system = 'one.dim',points = 200)
+trajectory(lakeMod, y0 = 4, t.end = 10, system = 'one.dim')
+```
+
+```{r}
+
+```
+
